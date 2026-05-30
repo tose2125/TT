@@ -56,7 +56,9 @@ namespace TT
         #endregion
 
         private const uint EVENT_SYSTEM_FOREGROUND = 3;
+        private const uint EVENT_OBJECT_NAMECHANGE = 0x800C;
         private const uint WINEVENT_OUTOFCONTEXT = 0;
+        private const int OBJID_WINDOW = 0;
 
         /// <summary>
         /// 現在のアクティブウィンドウ
@@ -94,14 +96,24 @@ namespace TT
         private readonly object _lock = new object();
 
         /// <summary>
-        /// Win32 APIイベントハンドラ
+        /// Win32 API EVENT_SYSTEM_FOREGROUND ハンドラ
         /// </summary>
-        private IntPtr _hookHandle;
+        private IntPtr _hookHandleForeground;
+
+        /// <summary>
+        /// Win32 API EVENT_OBJECT_NAMECHANGE ハンドラ
+        /// </summary>
+        private IntPtr _hookHandleNameChange;
 
         /// <summary>
         /// コールバックデリゲートをフィールドに保持（GCで回収されないように）
         /// </summary>
-        private readonly WinEventDelegate _winEventProc;
+        private readonly WinEventDelegate _eventProcForeground;
+
+        /// <summary>
+        /// コールバックデリゲートをフィールドに保持（GCで回収されないように）
+        /// </summary>
+        private readonly WinEventDelegate _eventProcNameChange;
 
         internal WindowTT()
         {
@@ -115,35 +127,53 @@ namespace TT
             _histories = new List<History>();
             _threshold = TimeSpan.FromMinutes(1);
             _timerFrequency = TimeSpan.FromMinutes(1);
-            _timer = new System.Timers.Timer(_timerFrequency.TotalMilliseconds)
+            _timer = new Timer(_timerFrequency.TotalMilliseconds)
             {
                 AutoReset = true
             };
             _timer.Elapsed += OnTimerEveryMinute;
-            _winEventProc = OnActiveWindowChanged;
+            _eventProcForeground = OnActiveWindowChanged;
+            _eventProcNameChange = OnWindowNameChanged;
         }
 
         public void Start()
         {
             _timer.Enabled = true;
-            _hookHandle = SetWinEventHook(
+
+            _hookHandleForeground = SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
                 EVENT_SYSTEM_FOREGROUND,
                 IntPtr.Zero,
-                _winEventProc,
+                _eventProcForeground,
                 0,
                 0,
                 WINEVENT_OUTOFCONTEXT);
+
+            _hookHandleNameChange = SetWinEventHook(
+                EVENT_OBJECT_NAMECHANGE,
+                EVENT_OBJECT_NAMECHANGE,
+                IntPtr.Zero,
+                _eventProcNameChange,
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT);
+
             Console.WriteLine("[DEBUG] Window TT started");
         }
 
         public void Stop()
         {
             Console.WriteLine("[DEBUG] Window TT stopping");
-            if (_hookHandle != IntPtr.Zero)
+            if (_hookHandleForeground != IntPtr.Zero)
             {
-                UnhookWinEvent(_hookHandle);
-                _hookHandle = IntPtr.Zero;
+                UnhookWinEvent(_hookHandleForeground);
+                _hookHandleForeground = IntPtr.Zero;
+            }
+
+            if (_hookHandleNameChange != IntPtr.Zero)
+            {
+                UnhookWinEvent(_hookHandleNameChange);
+                _hookHandleNameChange = IntPtr.Zero;
             }
 
             if (_timer != null)
@@ -177,6 +207,42 @@ namespace TT
                     EndTime = DateTime.Now,
                 };
                 Console.WriteLine("[DEBUG] Active window changed: '{0}'", _active.Name);
+            }
+        }
+
+        /// <summary>
+        /// アクティブウィンドウのタイトルが変わったら呼び出されるイベントハンドラ
+        /// </summary>
+        private void OnWindowNameChanged(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild,
+            uint dwEventThread, uint dwmsEventTime)
+        {
+            // 名前変更イベントの場合、ウィンドウオブジェクト以外は無視する
+            if (idObject != OBJID_WINDOW)
+            {
+                return;
+            }
+
+            Console.WriteLine("[DEBUG] OnWindowNameChanged");
+            lock (_lock)
+            {
+                var newTitle = GetActiveWindowTitle();
+
+                // タイトルが変わっていない場合は無視（同じウィンドウ内の別オブジェクトの名前変更など）
+                if (newTitle == _active.Name)
+                {
+                    return;
+                }
+
+                _active.EndTime = DateTime.Now;
+                _records.AddFirst(_active);
+                _active = new History
+                {
+                    Name = newTitle,
+                    StartTime = DateTime.Now,
+                    EndTime = DateTime.Now,
+                };
+
+                Console.WriteLine("[DEBUG] Active window name changed: {0}", newTitle);
             }
         }
 
