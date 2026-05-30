@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -40,17 +41,20 @@ namespace TT
         private delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject,
             int idChild, uint dwEventThread, uint dwmsEventTime);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
             WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr GetForegroundWindow();
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
 
         #endregion
@@ -74,6 +78,11 @@ namespace TT
         /// 分単位の代表の履歴
         /// </summary>
         private readonly List<History> _histories;
+
+        /// <summary>
+        /// 生記録に追加する閾値
+        /// </summary>
+        private readonly TimeSpan _recordThreshold;
 
         /// <summary>
         /// 代表とみなす閾値
@@ -125,6 +134,7 @@ namespace TT
             };
             _records = new LinkedList<History>();
             _histories = new List<History>();
+            _recordThreshold = TimeSpan.FromSeconds(1);
             _threshold = TimeSpan.FromMinutes(1);
             _timerFrequency = TimeSpan.FromMinutes(1);
             _timer = new Timer(_timerFrequency.TotalMilliseconds)
@@ -157,13 +167,10 @@ namespace TT
                 0,
                 0,
                 WINEVENT_OUTOFCONTEXT);
-
-            Console.WriteLine("[DEBUG] Window TT started");
         }
 
         public void Stop()
         {
-            Console.WriteLine("[DEBUG] Window TT stopping");
             if (_hookHandleForeground != IntPtr.Zero)
             {
                 UnhookWinEvent(_hookHandleForeground);
@@ -195,18 +202,20 @@ namespace TT
         private void OnActiveWindowChanged(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild,
             uint dwEventThread, uint dwmsEventTime)
         {
-            Console.WriteLine("[DEBUG] OnActiveWindowChanged");
             lock (_lock)
             {
                 _active.EndTime = DateTime.Now;
-                _records.AddFirst(_active);
+                if (_recordThreshold <= _active.Duration)
+                {
+                    _records.AddFirst(_active);
+                }
+
                 _active = new History
                 {
                     Name = GetActiveWindowTitle(),
                     StartTime = DateTime.Now,
                     EndTime = DateTime.Now,
                 };
-                Console.WriteLine("[DEBUG] Active window changed: '{0}'", _active.Name);
             }
         }
 
@@ -222,7 +231,6 @@ namespace TT
                 return;
             }
 
-            Console.WriteLine("[DEBUG] OnWindowNameChanged");
             lock (_lock)
             {
                 var newTitle = GetActiveWindowTitle();
@@ -234,15 +242,17 @@ namespace TT
                 }
 
                 _active.EndTime = DateTime.Now;
-                _records.AddFirst(_active);
+                if (_recordThreshold <= _active.Duration)
+                {
+                    _records.AddFirst(_active);
+                }
+
                 _active = new History
                 {
                     Name = newTitle,
                     StartTime = DateTime.Now,
                     EndTime = DateTime.Now,
                 };
-
-                Console.WriteLine("[DEBUG] Active window name changed: {0}", newTitle);
             }
         }
 
@@ -251,7 +261,6 @@ namespace TT
         /// </summary>
         private void OnTimerEveryMinute(object sender, ElapsedEventArgs e)
         {
-            Console.WriteLine("[DEBUG] OnTimerEveryMinute");
             lock (_lock)
             {
                 _active.EndTime = DateTime.Now;
@@ -302,15 +311,141 @@ namespace TT
                     _histories.Add(history);
                 }
 
-                Console.WriteLine("[DEBUG] History updated: '{0}'", _histories.Last().Name);
+                try
+                {
+                    ExportHistoryToCsv();
+                }
+                catch (Exception ex)
+                {
+                    // CSV 書き出しで例外が出てもトラッカー自体は継続させる
+                    Console.Error.WriteLine(ex.Message);
+                }
+            }
+        }
+
+        private void ExportHistoryToCsv()
+        {
+            const string csvPath = "histories.csv";
+            var filePath = Path.Combine(Environment.CurrentDirectory, csvPath);
+
+            // 書き出し対象（ヘッダー）
+            const string header = "date,start_time,end_time,event_type,event_value";
+
+            // 書き出し対象（直近の履歴）
+            var last = _histories.Last();
+            var date = last.StartTime.ToString("yyyy-MM-dd");
+            var startTime = last.StartTime.ToString("HH:mm");
+            var endTime = last.EndTime.ToString("HH:mm");
+            const string eventType = "window";
+            var eventValueRaw = last.Name ?? string.Empty;
+            // CSV の値は二重引用符で囲み、内部の二重引用符は二重化
+            var eventValueEscaped = "\"" + eventValueRaw.Replace("\"", "\"\"") + "\"";
+            var newLine = string.Format("{0},{1},{2},{3},{4}", date, startTime, endTime, eventType, eventValueEscaped);
+
+            using (var fileStream =
+                   new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+            {
+                var lines = new List<string>();
+                using (var reader = new StreamReader(
+                           fileStream,
+                           Encoding.UTF8,
+                           detectEncodingFromByteOrderMarks: true,
+                           bufferSize: 1024,
+                           leaveOpen: true))
+                {
+                    string line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        lines.Add(line);
+                    }
+                }
+
+                if (lines.Count == 0)
+                {
+                    using (var writer = new StreamWriter(fileStream, Encoding.UTF8))
+                    {
+                        writer.WriteLine(header);
+                        writer.WriteLine(newLine);
+                    }
+
+                    return;
+                }
+
+                // 最終有効行（空行はスキップ）
+                var result = lines.Select((line, index) => new { Line = line, Index = index }).Reverse()
+                    .FirstOrDefault(item => !string.IsNullOrWhiteSpace(item.Line));
+                var lastLine = result != null ? result.Line : null;
+                var lastLineNumber = result != null ? result.Index : -1;
+
+                // 既存の最終行がヘッダーのみの場合は追記にフォールバック
+                var hasHeader = lines.Count > 0 && lines[0].StartsWith("date,");
+
+                // 既存の最終行から date,start_time,event_value を取得
+                string lastDate = null, lastStartTime = null, lastEventType = null, lastValue = null;
+                if (!string.IsNullOrEmpty(lastLine) && (!hasHeader || lastLine != lines[0]))
+                {
+                    var columns = lastLine.Split(',');
+                    if (columns.Length >= 5)
+                    {
+                        lastDate = columns[0];
+                        lastStartTime = columns[1];
+                        // lastEndTime = columns[2];
+                        lastEventType = columns[3];
+                        var valPart = string.Join(",", columns.Skip(4)).Trim();
+                        // 先頭と末尾の二重引用符を外し、内部の二重引用符を元に戻す
+                        if (valPart.Length >= 2 && valPart[0] == '\"' &&
+                            valPart[valPart.Length - 1] == '\"')
+                        {
+                            valPart = valPart.Substring(1, valPart.Length - 2).Replace("\"\"", "\"");
+                        }
+
+                        lastValue = valPart;
+                    }
+                }
+
+                var isSameKey =
+                    string.Equals(lastDate, date, StringComparison.Ordinal) &&
+                    string.Equals(lastStartTime, startTime, StringComparison.Ordinal) &&
+                    string.Equals(lastEventType, eventType, StringComparison.Ordinal) &&
+                    string.Equals(lastValue, eventValueRaw, StringComparison.Ordinal);
+
+                if (isSameKey && lastLineNumber >= 0)
+                {
+                    // end_time を更新（行を置き換え）
+                    lines[lastLineNumber] = newLine;
+                    fileStream.SetLength(0);
+                    using (var writer = new StreamWriter(fileStream, Encoding.UTF8))
+                    {
+                        writer.BaseStream.Seek(0, SeekOrigin.Begin);
+                        foreach (var line in lines)
+                        {
+                            writer.WriteLine(line);
+                        }
+                    }
+                }
+                else
+                {
+                    // 追記
+                    using (var writer = new StreamWriter(fileStream, Encoding.UTF8))
+                    {
+                        writer.BaseStream.Seek(0, SeekOrigin.End);
+                        writer.WriteLine(newLine);
+                    }
+                }
             }
         }
 
         private static string GetActiveWindowTitle()
         {
             var foregroundWindow = GetForegroundWindow();
-            var sb = new StringBuilder(256);
-            GetWindowText(foregroundWindow, sb, 256);
+            var length = GetWindowTextLength(foregroundWindow);
+            if (length == 0)
+            {
+                return string.Empty;
+            }
+
+            var sb = new StringBuilder(length + 1);
+            GetWindowText(foregroundWindow, sb, sb.Capacity);
             return sb.ToString();
         }
     }
@@ -367,16 +502,16 @@ namespace TT
             public POINT pt;
         }
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern sbyte GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern bool TranslateMessage([In] ref MSG lpMsg);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr DispatchMessage([In] ref MSG lpMsg);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         internal static extern void PostQuitMessage(int nExitCode);
 
         internal static void MessageLoop()
