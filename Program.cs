@@ -292,6 +292,21 @@ namespace TT
                     }
                 }
 
+                // 後ろの要素を削除
+                var lastNode = _records.Find(recordToAddToHistories);
+                if (lastNode != null)
+                {
+                    lastNode = lastNode.Next;
+                    if (lastNode != null)
+                    {
+                        // lastNode より後ろをすべて削除する
+                        while (_records.Last != lastNode)
+                        {
+                            _records.RemoveLast(); // 末尾から順番に消していく
+                        }
+                    }
+                }
+
                 // 履歴へ追加
                 if (_histories.Count > 0 && _histories.Last().Name == recordToAddToHistories.Name)
                 {
@@ -412,16 +427,41 @@ namespace TT
                 if (isSameKey && lastLineNumber >= 0)
                 {
                     // end_time を更新（行を置き換え）
-                    lines[lastLineNumber] = newLine;
-                    fileStream.SetLength(0);
-                    using (var writer = new StreamWriter(fileStream, Encoding.UTF8))
+                    var position = fileStream.Length - 1;
+                    var foundNewLine = false;
+
+                    // 1. 末尾から逆方向に1バイトずつ読み、改行コード（\n）を探す
+                    while (position >= 0)
                     {
-                        writer.BaseStream.Seek(0, SeekOrigin.Begin);
-                        foreach (var line in lines)
+                        fileStream.Position = position;
+                        var b = fileStream.ReadByte();
+
+                        // 完全に末尾にある改行は無視するため、position < fs.Length - 1 の条件を入れる
+                        if (b == '\n' && position < fileStream.Length - 1)
                         {
-                            writer.WriteLine(line);
+                            // 改行コードの次の位置が「最後の行の先頭」
+                            fileStream.Position = position + 1;
+                            foundNewLine = true;
+                            break;
                         }
+
+                        position--;
                     }
+
+                    // ファイルに改行が一つもなかった場合は、ファイルの先頭（0）が最後の行の先頭になる
+                    if (!foundNewLine)
+                    {
+                        fileStream.Position = 0;
+                    }
+
+                    // 2. 新しい行のデータを書き込む
+                    var startWritePosition = fileStream.Position; // 書き換え開始位置を記憶
+                    var buffer = Encoding.UTF8.GetBytes(newLine + Environment.NewLine);
+                    fileStream.Write(buffer, 0, buffer.Length);
+
+                    // 3. 古い行の残骸を消す
+                    // 新しい行の方が短かった場合、古い文字が残ってしまうのを防ぐ
+                    fileStream.SetLength(startWritePosition + buffer.Length);
                 }
                 else
                 {
@@ -453,7 +493,7 @@ namespace TT
     /// <summary>
     /// アクティブウィンドウの履歴・記録
     /// </summary>
-    internal struct History
+    internal struct History : IEquatable<History>
     {
         /// <summary>
         /// ウィンドウの名前
@@ -476,6 +516,11 @@ namespace TT
         internal TimeSpan Duration
         {
             get { return EndTime - StartTime; }
+        }
+
+        public bool Equals(History other)
+        {
+            return Name == other.Name && StartTime.Equals(other.StartTime) && EndTime.Equals(other.EndTime);
         }
     }
 
