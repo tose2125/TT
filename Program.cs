@@ -4,7 +4,6 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading.Tasks;
 using System.Timers;
 
 namespace TT
@@ -15,14 +14,6 @@ namespace TT
         {
             var tt = new WindowTT();
             tt.Start();
-            Console.WriteLine("Press any key to exit...");
-
-            // 別スレッドでキー入力を待ち、押されたらWM_QUITを送ってメッセージループを終了
-            var keyWaiter = Task.Run(() =>
-            {
-                Console.ReadKey(true);
-                NativeMethods.PostQuitMessage(0);
-            });
 
             // Win32 APIのメッセージループを回す（WinEventフックのため）
             NativeMethods.MessageLoop();
@@ -167,6 +158,8 @@ namespace TT
                 0,
                 0,
                 WINEVENT_OUTOFCONTEXT);
+
+            Console.WriteLine("Started at {0}", DateTime.Now);
         }
 
         public void Stop()
@@ -334,6 +327,24 @@ namespace TT
                 {
                     // CSV 書き出しで例外が出てもトラッカー自体は継続させる
                     Console.Error.WriteLine(ex.Message);
+                }
+
+                Console.Clear();
+                var summary = _histories
+                    .GroupBy(h => h.Name)
+                    .Select(g => new
+                    {
+                        Name = g.Key,
+                        TotalDuration = new TimeSpan(g.Sum(h => h.Duration.Ticks))
+                    })
+                    .OrderByDescending(x => x.TotalDuration)
+                    .Take(10);
+
+                Console.WriteLine("Top 10 Windows at {0}", DateTime.Now);
+                Console.WriteLine("-------------------------------------");
+                foreach (var item in summary)
+                {
+                    Console.WriteLine("{0:g} | {1}", item.TotalDuration, item.Name);
                 }
             }
         }
